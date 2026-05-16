@@ -23,3 +23,18 @@ cd terraform-plan-parser
 
 # Build and install
 cargo install --path .
+```
+
+## Usage
+
+```bash
+terraform_plan_parser [DIRECTORY] [--format text|json|csv] [--no-emoji]
+```
+
+- `DIRECTORY` defaults to the current directory.
+- `--format` controls output rendering and defaults to `text`.
+- `--no-emoji` removes emoji from text output.
+
+## Architecture
+
+See [Architecture Notes](docs/architecture.md) for system architecture, data flow, design decisions, and future extension points.
