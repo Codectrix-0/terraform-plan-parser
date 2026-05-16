@@ -1,4 +1,10 @@
-terraform.tfstate
-terraform.tfstate.*
+# Rust
+/target/
+
+# Terraform
+*.tfstate
+*.tfstate.*
 .terraform/
-target/
+
+# OS
+.DS_Store
