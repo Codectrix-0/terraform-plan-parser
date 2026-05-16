@@ -15,8 +15,9 @@
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    CLI Interface Layer                      │
-│  • Parse command-line arguments (directory path, --help)    │
-│  • Validate directory exists and is a directory             │
+│  • Parse command-line arguments with clap derive macros      │
+│  • Accept directory/.tfplan, format, emoji, filter flags     │
+│  • Validate input exists and is a directory or .tfplan file │
 │  • Resolve absolute path (handles Windows relative paths)   │
 └──────────────────────┬──────────────────────────────────────┘
                        │
@@ -24,8 +25,8 @@
 ┌─────────────────────────────────────────────────────────────┐
 │                  Terraform Invocation Layer                 │
 │  • Verify `terraform` binary is available in PATH           │
-│  • Execute: `terraform plan -json -input=false -no-color`   │
-│  • Capture stdout (JSON stream) and stderr                  │
+│  • Execute live plans or `terraform show -json` for .tfplan  │
+│  • Stream live-plan stdout and capture stderr                │
 │  • Exit with code 1 if terraform fails                      │
 └──────────────────────┬──────────────────────────────────────┘
                        │
@@ -44,8 +45,8 @@
 │                   Rendering Layer                           │
 │  • Map actions to emoji symbols:                            │
 │  │ create → ➕ | update → 🔄 | delete → ➖ | read → 📖      │
-│  • Print formatted summary table                            │
-│  • Handle empty state: "✅ No resource changes detected"    │
+│  • Print text, JSON, CSV, or table output                    │
+│  • Handle empty text state: "✅ No resource changes detected"│
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -77,16 +78,19 @@ Terraform Project Directory
 
 ```text
 src/
-├── main.rs              # Single-file application (no submodules)
-│   ├── print_help()     # CLI help text
-│   └── main()           # Entry point: args → validate → run → parse → render
+├── main.rs                 # Single-file application (no submodules)
+│   ├── ResourceChange      # In-memory parsed change model
+│   ├── PlanLine structs    # Typed serde models for Terraform JSON lines
+│   ├── Cli / Format       # clap-powered CLI arguments and output mode
+│   ├── parse_plan_output() # NDJSON parser for Terraform output
+│   └── main()              # Entry point: args → validate → run → parse → render
 ```
 
 The project is intentionally kept as a single-file CLI for simplicity. As features grow, consider splitting it into:
 
 - `cli.rs` — argument parsing
 - `terraform.rs` — Terraform process management
-- `parser.rs` — JSON deserialization models
+- `parser.rs` — JSON deserialization models and `parse_plan_output` tests
 - `renderer.rs` — output formatting
 
 ## Key Design Decisions
@@ -105,6 +109,7 @@ The project is intentionally kept as a single-file CLI for simplicity. As featur
 | --- | --- |
 | `serde` | Derive macros for JSON deserialization. |
 | `serde_json` | Runtime JSON parsing. |
+| `clap` | Command-line argument parsing via derive macros. |
 
 `requirements.txt` exists for documentation/reference only. Actual dependency management is via `Cargo.toml`.
 
@@ -143,5 +148,5 @@ The project is intentionally kept as a single-file CLI for simplicity. As featur
 | Language | Rust (Edition 2021) |
 | JSON Parsing | `serde` + `serde_json` |
 | Process Spawning | `std::process::Command` |
-| CLI Args | `std::env::args` manual parsing |
+| CLI Args | `clap` derive macros |
 | Target Platforms | Windows, macOS, Linux |

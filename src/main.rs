@@ -1,16 +1,30 @@
 use clap::Parser;
 use serde::{Deserialize, Serialize};
-use std::{path::Path, process::Command};
+use std::{
+    io::{BufRead, BufReader, Read},
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    thread,
+};
 
 #[derive(Parser)]
 #[command(name = "terraform_plan_parser")]
 struct Cli {
+    /// Terraform project directory or saved .tfplan file to inspect.
     #[arg(default_value = ".")]
     directory: String,
     #[arg(long, value_enum, default_value = "text")]
     format: Format,
     #[arg(long)]
     no_emoji: bool,
+    #[arg(long, value_delimiter = ',')]
+    include_type: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    exclude_type: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    include_action: Vec<String>,
+    #[arg(long, value_delimiter = ',')]
+    exclude_action: Vec<String>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug)]
@@ -18,6 +32,7 @@ enum Format {
     Text,
     Json,
     Csv,
+    Table,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -46,53 +61,133 @@ struct PlanResource {
     resource_name: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ShowPlan {
+    resource_changes: Option<Vec<ShowResourceChange>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShowResourceChange {
+    #[serde(default = "unknown_value", rename = "type")]
+    resource_type: String,
+    #[serde(default = "unknown_value")]
+    name: String,
+    change: ShowChange,
+}
+
+#[derive(Debug, Deserialize)]
+struct ShowChange {
+    #[serde(default)]
+    actions: Vec<String>,
+}
+
+#[derive(Debug)]
+enum TerraformInput {
+    Directory(PathBuf),
+    PlanFile(PathBuf),
+}
+
 fn unknown_value() -> String {
     "unknown".to_string()
 }
 
-fn parse_plan_output(stdout: &str) -> Vec<ResourceChange> {
-    stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<PlanLine>(line).ok())
-        .filter_map(|line| {
-            let change = line.change?;
-            let resource = change.resource?;
+fn parse_plan_line(line: &str) -> Option<ResourceChange> {
+    let line = serde_json::from_str::<PlanLine>(line).ok()?;
+    let change = line.change?;
+    let resource = change.resource?;
 
+    Some(ResourceChange {
+        resource_type: resource.resource_type,
+        resource_name: resource.resource_name,
+        action: change.action.unwrap_or_else(|| "noop".to_string()),
+    })
+}
+
+#[cfg(test)]
+fn parse_plan_output(stdout: &str) -> Vec<ResourceChange> {
+    let line_changes: Vec<ResourceChange> = stdout.lines().filter_map(parse_plan_line).collect();
+
+    if line_changes.is_empty() {
+        parse_show_plan_output(stdout).unwrap_or_default()
+    } else {
+        line_changes
+    }
+}
+
+fn parse_show_plan_output(stdout: &str) -> Result<Vec<ResourceChange>, serde_json::Error> {
+    let plan = serde_json::from_str::<ShowPlan>(stdout)?;
+    Ok(plan
+        .resource_changes
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|change| {
+            let action = action_from_show_actions(&change.change.actions)?;
             Some(ResourceChange {
-                resource_type: resource.resource_type,
-                resource_name: resource.resource_name,
-                action: change.action.unwrap_or_else(|| "noop".to_string()),
+                resource_type: change.resource_type,
+                resource_name: change.name,
+                action,
             })
+        })
+        .collect())
+}
+
+fn action_from_show_actions(actions: &[String]) -> Option<String> {
+    match actions {
+        [] => None,
+        [action] if action == "no-op" => None,
+        [action] => Some(action.clone()),
+        [first, second] if first == "delete" && second == "create" => Some("replace".to_string()),
+        _ => Some(actions.join("/")),
+    }
+}
+
+fn filter_changes(resource_changes: Vec<ResourceChange>, cli: &Cli) -> Vec<ResourceChange> {
+    resource_changes
+        .into_iter()
+        .filter(|change| {
+            matches_filter(&change.resource_type, &cli.include_type, &cli.exclude_type)
+                && matches_filter(&change.action, &cli.include_action, &cli.exclude_action)
         })
         .collect()
 }
 
+fn matches_filter(value: &str, include: &[String], exclude: &[String]) -> bool {
+    (include.is_empty() || include.iter().any(|item| item == value))
+        && !exclude.iter().any(|item| item == value)
+}
+
 fn render_changes(
     resource_changes: &[ResourceChange],
-    abs_dir: &Path,
+    abs_path: &Path,
     format: &Format,
     no_emoji: bool,
-) {
+) -> String {
     match format {
-        Format::Text => render_text(resource_changes, abs_dir, no_emoji),
+        Format::Text => render_text(resource_changes, abs_path, no_emoji),
         Format::Json => render_json(resource_changes),
         Format::Csv => render_csv(resource_changes),
+        Format::Table => render_table(resource_changes, abs_path),
     }
 }
 
-fn render_text(resource_changes: &[ResourceChange], abs_dir: &Path, no_emoji: bool) {
+fn render_text(resource_changes: &[ResourceChange], abs_path: &Path, no_emoji: bool) -> String {
+    let mut output = String::new();
     if resource_changes.is_empty() {
         let prefix = if no_emoji { "" } else { "✅ " };
-        println!(
-            "{}No resource changes detected in '{}'.",
+        output.push_str(&format!(
+            "{}No resource changes detected in '{}'.\n",
             prefix,
-            abs_dir.display()
-        );
-        return;
+            abs_path.display()
+        ));
+        return output;
     }
 
     let prefix = if no_emoji { "" } else { "📊 " };
-    println!("{}Planned changes in '{}':", prefix, abs_dir.display());
+    output.push_str(&format!(
+        "{}Planned changes in '{}':\n",
+        prefix,
+        abs_path.display()
+    ));
     for change in resource_changes {
         let symbol = if no_emoji {
             ""
@@ -105,30 +200,79 @@ fn render_text(resource_changes: &[ResourceChange], abs_dir: &Path, no_emoji: bo
                 _ => "• ",
             }
         };
-        println!(
-            "{}{} {} ({})",
+        output.push_str(&format!(
+            "{}{} {} ({})\n",
             symbol, change.resource_type, change.resource_name, change.action
-        );
+        ));
     }
+    output
 }
 
-fn render_json(resource_changes: &[ResourceChange]) {
-    println!(
-        "{}",
+fn render_json(resource_changes: &[ResourceChange]) -> String {
+    format!(
+        "{}\n",
         serde_json::to_string_pretty(resource_changes).expect("resource changes serialize to JSON")
-    );
+    )
 }
 
-fn render_csv(resource_changes: &[ResourceChange]) {
-    println!("resource_type,resource_name,action");
+fn render_csv(resource_changes: &[ResourceChange]) -> String {
+    let mut output = String::from("resource_type,resource_name,action\n");
     for change in resource_changes {
-        println!(
-            "{},{},{}",
+        output.push_str(&format!(
+            "{},{},{}\n",
             csv_escape(&change.resource_type),
             csv_escape(&change.resource_name),
             csv_escape(&change.action)
+        ));
+    }
+    output
+}
+
+fn render_table(resource_changes: &[ResourceChange], abs_path: &Path) -> String {
+    if resource_changes.is_empty() {
+        return format!(
+            "No resource changes detected in '{}'.\n",
+            abs_path.display()
         );
     }
+
+    let type_width = resource_changes
+        .iter()
+        .map(|change| change.resource_type.len())
+        .chain(["Resource Type".len()])
+        .max()
+        .unwrap_or("Resource Type".len());
+    let name_width = resource_changes
+        .iter()
+        .map(|change| change.resource_name.len())
+        .chain(["Resource Name".len()])
+        .max()
+        .unwrap_or("Resource Name".len());
+    let action_width = resource_changes
+        .iter()
+        .map(|change| change.action.len())
+        .chain(["Action".len()])
+        .max()
+        .unwrap_or("Action".len());
+
+    let mut output = format!("Planned changes in '{}':\n", abs_path.display());
+    output.push_str(&format!(
+        "{:<type_width$}  {:<name_width$}  {:<action_width$}\n",
+        "Resource Type", "Resource Name", "Action"
+    ));
+    output.push_str(&format!(
+        "{:-<type_width$}  {:-<name_width$}  {:-<action_width$}\n",
+        "", "", ""
+    ));
+
+    for change in resource_changes {
+        output.push_str(&format!(
+            "{:<type_width$}  {:<name_width$}  {:<action_width$}\n",
+            change.resource_type, change.resource_name, change.action
+        ));
+    }
+
+    output
 }
 
 fn csv_escape(value: &str) -> String {
@@ -139,65 +283,178 @@ fn csv_escape(value: &str) -> String {
     }
 }
 
-fn main() {
-    let cli = Cli::parse();
-
-    let path = Path::new(&cli.directory);
+fn resolve_input(path: &str) -> Result<TerraformInput, String> {
+    let path = Path::new(path);
     if !path.exists() {
-        eprintln!("Directory does not exist: {}", cli.directory);
-        std::process::exit(1);
-    }
-    if !path.is_dir() {
-        eprintln!("Path is not a directory: {}", cli.directory);
-        std::process::exit(1);
+        return Err(format!("Path does not exist: {}", path.display()));
     }
 
-    // Get absolute path to avoid Windows relative-path issues with .current_dir()
-    let abs_dir = std::env::current_dir()
+    let abs_path = std::env::current_dir()
         .unwrap_or_else(|_| Path::new(".").to_path_buf())
-        .join(path);
-    let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
+        .join(path)
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf());
 
-    // Verify terraform is available
-    if Command::new("terraform").arg("version").output().is_err() {
-        eprintln!("Error: 'terraform' not found in PATH. Is Terraform installed?");
-        std::process::exit(1);
+    if abs_path.is_dir() {
+        return Ok(TerraformInput::Directory(abs_path));
     }
 
-    let output = Command::new("terraform")
+    if abs_path.is_file() && abs_path.extension().is_some_and(|ext| ext == "tfplan") {
+        return Ok(TerraformInput::PlanFile(abs_path));
+    }
+
+    Err(format!(
+        "Path is not a directory or .tfplan file: {}",
+        path.display()
+    ))
+}
+
+fn verify_terraform_available() -> Result<(), String> {
+    Command::new("terraform")
+        .arg("version")
+        .output()
+        .map(|_| ())
+        .map_err(|_| "Error: 'terraform' not found in PATH. Is Terraform installed?".to_string())
+}
+
+fn run_terraform(input: &TerraformInput) -> Result<Vec<ResourceChange>, String> {
+    match input {
+        TerraformInput::Directory(directory) => run_terraform_plan(directory),
+        TerraformInput::PlanFile(plan_file) => run_terraform_show(plan_file),
+    }
+}
+
+fn run_terraform_plan(directory: &Path) -> Result<Vec<ResourceChange>, String> {
+    let mut child = Command::new("terraform")
         .arg("plan")
         .arg("-json")
         .arg("-input=false")
         .arg("-no-color")
-        .current_dir(&abs_dir)
+        .current_dir(directory)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| {
+            format!(
+                "Failed to execute terraform in '{}': {error}",
+                directory.display()
+            )
+        })?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture terraform stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture terraform stderr".to_string())?;
+
+    let stderr_handle = thread::spawn(move || {
+        let mut stderr_output = String::new();
+        let mut reader = BufReader::new(stderr);
+        reader
+            .read_to_string(&mut stderr_output)
+            .map(|_| stderr_output)
+    });
+
+    let mut resource_changes = Vec::new();
+    for line in BufReader::new(stdout).lines() {
+        let line = line.map_err(|error| format!("Failed to read terraform stdout: {error}"))?;
+        if let Some(change) = parse_plan_line(&line) {
+            resource_changes.push(change);
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("Failed to wait for terraform plan: {error}"))?;
+    let stderr = stderr_handle
+        .join()
+        .map_err(|_| "Failed to join terraform stderr reader".to_string())?
+        .map_err(|error| format!("Failed to read terraform stderr: {error}"))?;
+
+    if !status.success() {
+        return Err(format!(
+            "Terraform plan failed in '{}':\n{}",
+            directory.display(),
+            stderr
+        ));
+    }
+
+    Ok(resource_changes)
+}
+
+fn run_terraform_show(plan_file: &Path) -> Result<Vec<ResourceChange>, String> {
+    let current_dir = plan_file.parent().unwrap_or_else(|| Path::new("."));
+    let output = Command::new("terraform")
+        .arg("show")
+        .arg("-json")
+        .arg(plan_file)
+        .current_dir(current_dir)
         .output()
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "Failed to execute terraform in '{}': {}",
-                abs_dir.display(),
-                e
-            );
-            std::process::exit(1);
-        });
+        .map_err(|error| {
+            format!(
+                "Failed to execute terraform show for '{}': {error}",
+                plan_file.display()
+            )
+        })?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!(
-            "Terraform plan failed in '{}':\n{}",
-            abs_dir.display(),
+        return Err(format!(
+            "Terraform show failed for '{}':\n{}",
+            plan_file.display(),
             stderr
-        );
-        std::process::exit(1);
+        ));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let resource_changes = parse_plan_output(&stdout);
-    render_changes(&resource_changes, &abs_dir, &cli.format, cli.no_emoji);
+    parse_show_plan_output(&stdout).map_err(|error| {
+        format!(
+            "Failed to parse terraform show JSON for '{}': {error}",
+            plan_file.display()
+        )
+    })
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let input = resolve_input(&cli.directory).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+
+    verify_terraform_available().unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+
+    let resource_changes = run_terraform(&input).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    let resource_changes = filter_changes(resource_changes, &cli);
+    let display_path = match &input {
+        TerraformInput::Directory(directory) => directory.as_path(),
+        TerraformInput::PlanFile(plan_file) => plan_file.as_path(),
+    };
+
+    print!(
+        "{}",
+        render_changes(&resource_changes, display_path, &cli.format, cli.no_emoji)
+    );
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{csv_escape, parse_plan_output, ResourceChange};
+    use super::{
+        csv_escape, filter_changes, parse_plan_output, render_csv, render_table, Cli, Format,
+        ResourceChange,
+    };
+    use clap::Parser;
+    use std::path::Path;
 
     #[test]
     fn parses_resource_changes_from_ndjson() {
@@ -224,6 +481,33 @@ not-json
     }
 
     #[test]
+    fn parses_saved_plan_json_output() {
+        let stdout = r#"{
+  "resource_changes": [
+    {
+      "type": "aws_instance",
+      "name": "web",
+      "change": { "actions": ["delete", "create"] }
+    },
+    {
+      "type": "aws_s3_bucket",
+      "name": "logs",
+      "change": { "actions": ["no-op"] }
+    }
+  ]
+}"#;
+
+        assert_eq!(
+            parse_plan_output(stdout),
+            vec![ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "replace".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn ignores_lines_without_resource_changes() {
         let stdout = r#"{"@level":"info","message":"Refreshing state..."}
 {"change":{"action":"create"}}
@@ -241,9 +525,78 @@ not-json
     }
 
     #[test]
-    fn escapes_csv_fields_that_need_quotes() {
+    fn filters_changes_by_type_and_action() {
+        let cli = Cli::parse_from([
+            "terraform_plan_parser",
+            "--include-type",
+            "aws_instance,aws_s3_bucket",
+            "--exclude-type",
+            "aws_s3_bucket",
+            "--include-action",
+            "create",
+        ]);
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "old".to_string(),
+                action: "delete".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            filter_changes(changes, &cli),
+            vec![ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn renders_csv_and_escapes_fields_that_need_quotes() {
         assert_eq!(csv_escape("plain"), "plain");
         assert_eq!(csv_escape("name,with,commas"), "\"name,with,commas\"");
         assert_eq!(csv_escape("name \"quoted\""), "\"name \"\"quoted\"\"\"");
+        assert_eq!(
+            render_csv(&[ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            }]),
+            "resource_type,resource_name,action\naws_instance,web,create\n"
+        );
+    }
+
+    #[test]
+    fn renders_table_output() {
+        let output = render_table(
+            &[ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            }],
+            Path::new("/tmp/project"),
+        );
+
+        assert!(output.contains("Resource Type"));
+        assert!(output.contains("aws_instance"));
+        assert!(output.contains("create"));
+    }
+
+    #[test]
+    fn accepts_table_format_from_cli() {
+        let cli = Cli::parse_from(["terraform_plan_parser", "--format", "table"]);
+        assert!(matches!(cli.format, Format::Table));
     }
 }

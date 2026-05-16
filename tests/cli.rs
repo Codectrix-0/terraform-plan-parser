@@ -1,0 +1,152 @@
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+fn temp_dir(name: &str) -> PathBuf {
+    let mut dir = env::temp_dir();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time is after unix epoch")
+        .as_nanos();
+    dir.push(format!(
+        "terraform_plan_parser_{name}_{}_{}",
+        std::process::id(),
+        nanos
+    ));
+    fs::create_dir_all(&dir).expect("create temp dir");
+    dir
+}
+
+fn prepend_path(bin_dir: &Path) -> String {
+    let existing = env::var_os("PATH").unwrap_or_default();
+    let mut paths = vec![bin_dir.to_path_buf()];
+    paths.extend(env::split_paths(&existing));
+    env::join_paths(paths)
+        .expect("join PATH entries")
+        .to_string_lossy()
+        .into_owned()
+}
+
+#[cfg(unix)]
+fn write_mock_terraform(bin_dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let terraform = bin_dir.join("terraform");
+    fs::write(
+        &terraform,
+        r#"#!/bin/sh
+set -eu
+case "$1" in
+  version)
+    echo "Terraform v1.6.0"
+    ;;
+  plan)
+    echo '{"@level":"info","change":{"resource":{"resource_type":"aws_instance","resource_name":"web"},"action":"create"}}'
+    echo '{"@level":"info","change":{"resource":{"resource_type":"aws_s3_bucket","resource_name":"logs"},"action":"delete"}}'
+    ;;
+  show)
+    cat <<'JSON'
+{"resource_changes":[{"type":"aws_instance","name":"web","change":{"actions":["delete","create"]}}]}
+JSON
+    ;;
+  *)
+    echo "unexpected terraform command: $*" >&2
+    exit 1
+    ;;
+esac
+"#,
+    )
+    .expect("write mock terraform");
+    let mut permissions = fs::metadata(&terraform)
+        .expect("read mock metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(terraform, permissions).expect("make mock executable");
+}
+
+#[cfg(windows)]
+fn write_mock_terraform(bin_dir: &Path) {
+    fs::write(
+        bin_dir.join("terraform.bat"),
+        r#"@echo off
+if "%1" == "version" (
+  echo Terraform v1.6.0
+  exit /b 0
+)
+if "%1" == "plan" (
+  echo {"@level":"info","change":{"resource":{"resource_type":"aws_instance","resource_name":"web"},"action":"create"}}
+  echo {"@level":"info","change":{"resource":{"resource_type":"aws_s3_bucket","resource_name":"logs"},"action":"delete"}}
+  exit /b 0
+)
+if "%1" == "show" (
+  echo {"resource_changes":[{"type":"aws_instance","name":"web","change":{"actions":["delete","create"]}}]}
+  exit /b 0
+)
+echo unexpected terraform command: %* 1>&2
+exit /b 1
+"#,
+    )
+    .expect("write mock terraform");
+}
+
+#[test]
+fn renders_csv_from_mocked_live_plan() {
+    let root = temp_dir("live_plan");
+    let bin_dir = root.join("bin");
+    let project_dir = root.join("project");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    fs::create_dir_all(&project_dir).expect("create project dir");
+    write_mock_terraform(&bin_dir);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_terraform_plan_parser"))
+        .arg(&project_dir)
+        .arg("--format")
+        .arg("csv")
+        .env("PATH", prepend_path(&bin_dir))
+        .output()
+        .expect("run terraform_plan_parser");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "resource_type,resource_name,action\naws_instance,web,create\naws_s3_bucket,logs,delete\n"
+    );
+
+    fs::remove_dir_all(root).expect("remove temp dir");
+}
+
+#[test]
+fn renders_json_from_mocked_saved_plan_file() {
+    let root = temp_dir("saved_plan");
+    let bin_dir = root.join("bin");
+    fs::create_dir_all(&bin_dir).expect("create bin dir");
+    write_mock_terraform(&bin_dir);
+    let plan_file = root.join("plan.tfplan");
+    fs::write(&plan_file, "mock plan").expect("write plan file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_terraform_plan_parser"))
+        .arg(&plan_file)
+        .arg("--format")
+        .arg("json")
+        .env("PATH", prepend_path(&bin_dir))
+        .output()
+        .expect("run terraform_plan_parser");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(r#""resource_type": "aws_instance""#));
+    assert!(stdout.contains(r#""action": "replace""#));
+
+    fs::remove_dir_all(root).expect("remove temp dir");
+}

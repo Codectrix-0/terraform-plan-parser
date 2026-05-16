@@ -1,60 +1,22 @@
-# TODO — terraform-plan-parser
+# TODO
 
-## High Priority
+## Completed
 
-- [ ] **Add proper CLI argument parsing with `clap`**
-  - Replace manual `std::env::args()` with `clap` (derive feature)
-  - Add flags: `--help`, `--version`, `--format`, `--filter-action`, `--no-emoji`
-  - Example usage:
-    ```bash
-    terraform_plan_parser --format json ./my-project
-    terraform_plan_parser --filter-action create,update
-    terraform_plan_parser --no-emoji
-    ```
+- [x] Check for an existing `todo.md` file and confirm the repository did not currently include one.
+- [x] Extract Terraform JSON parsing into a dedicated `parse_plan_output` helper.
+- [x] Replace ad-hoc `serde_json::Value` traversal with typed `serde` deserialization structs.
+- [x] Add parser unit tests for newline-delimited Terraform JSON, invalid JSON lines, and missing actions.
+- [x] Keep the architecture notes discoverable from the README.
+- [x] Add more follow-up items to this TODO list.
 
-- [ ] **Add a comprehensive `.gitignore`**
-  - Rust: `/target`, `**/*.rs.bk`
-  - Terraform: `*.tfstate`, `*.tfstate.*`, `.terraform/`, `.terraform.lock.hcl`
-  - Decide on `Cargo.lock` (keep for binaries)
+## Follow-up
 
-- [ ] **Add GitHub Actions CI/CD**
-  - `.github/workflows/ci.yml`
-  - Run `cargo build`, `cargo test`, `cargo fmt --check`, `cargo clippy`
-  - Trigger on push and PR to `main`
+- [x] Stream Terraform stdout directly from the child process instead of waiting for the full command output before parsing.
+- [x] Add CLI flags for structured output formats such as `--format json`, `--format csv`, and `--format table`.
+- [x] Add filtering flags such as `--include-type`, `--exclude-type`, `--include-action`, and `--exclude-action`.
+- [x] Support parsing saved `.tfplan` files in addition to running a live `terraform plan` command.
+- [x] Add integration tests that exercise CLI behavior with a mocked `terraform` executable.
 
-## Medium Priority
+## Notes
 
-- [ ] **Add structured output formats**
-  - `--format json` for CI/CD integration
-  - `--format csv` for spreadsheet/reporting
-  - Keep current emoji text as default
-
-- [ ] **Add unit and integration tests**
-  - Unit tests for JSON parsing logic
-  - Integration tests with sample `terraform plan -json` output fixtures
-  - Mock `terraform` command for testing without real Terraform
-
-- [ ] **Add pre-commit hooks**
-  - `cargo fmt`, `cargo clippy`, `cargo test`
-  - Use `pre-commit` framework or simple git hooks
-
-## Low Priority / Future
-
-- [ ] **Support saved `.tfplan` files**
-  - `--plan-file plan.tfplan` instead of live `terraform plan -json`
-  - Useful for CI pipelines where plan is generated in a previous step
-
-- [ ] **Add logging/tracing**
-  - Replace `println!`/`eprintln!` with `tracing` or `log` crate
-  - Configurable levels: `info`, `warn`, `error`, `debug`
-
-- [ ] **Add filtering capabilities**
-  - `--include-type aws_instance`
-  - `--exclude-action read`
-  - `--only-destructive` (show only delete/update)
-
-- [ ] **Add configuration file support**
-  - `.terraform-plan-parser.toml` for persistent filters and defaults
-
-- [ ] **Consolidate architecture docs**
-  - Merge `ARCHITECTURE.md` (root) and `docs/architecture.md` into one canonical doc
+- [x] Searched for `suggestions.json`; it is not present in this workspace, so no suggestion-file tasks could be applied.
