@@ -7,7 +7,7 @@ use std::{
 
 fn temp_dir(name: &str) -> PathBuf {
     let mut dir = env::temp_dir();
-    
+
     // On Windows, the `\\?\` prefix breaks PATH lookups for child processes.
     // Stripping it allows the mock `terraform.bat` to be found in the PATH.
     #[cfg(windows)]
@@ -27,9 +27,6 @@ fn temp_dir(name: &str) -> PathBuf {
         std::process::id(),
         nanos
     ));
-    fs::create_dir_all(&dir).expect("create temp dir");
-    dir
-}
     fs::create_dir_all(&dir).expect("create temp dir");
     dir
 }
