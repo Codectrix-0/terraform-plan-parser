@@ -1,4 +1,5 @@
 use clap::Parser;
+use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use std::{
     io::{BufRead, BufReader, Read},
@@ -24,13 +25,23 @@ struct Cli {
     format: Format,
     #[arg(long)]
     no_emoji: bool,
-    #[arg(long, value_delimiter = ',')]
+    /// Include only resource types matching these comma-separated glob patterns.
+    ///
+    /// Exact values still work, and wildcards such as `aws_*` or `*instance`
+    /// match multiple resource types.
+    #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     include_type: Vec<String>,
-    #[arg(long, value_delimiter = ',')]
+    /// Exclude resource types matching these comma-separated glob patterns.
+    ///
+    /// Exact values still work, and wildcards such as `aws_*` or `*bucket`
+    /// match multiple resource types.
+    #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     exclude_type: Vec<String>,
-    #[arg(long, value_delimiter = ',')]
+    /// Include only actions matching these comma-separated glob patterns.
+    #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     include_action: Vec<String>,
-    #[arg(long, value_delimiter = ',')]
+    /// Exclude actions matching these comma-separated glob patterns.
+    #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     exclude_action: Vec<String>,
 }
 
@@ -165,8 +176,17 @@ fn filter_changes(resource_changes: Vec<ResourceChange>, cli: &Cli) -> Vec<Resou
 }
 
 fn matches_filter(value: &str, include: &[String], exclude: &[String]) -> bool {
-    (include.is_empty() || include.iter().any(|item| item == value))
-        && !exclude.iter().any(|item| item == value)
+    (include.is_empty()
+        || include
+            .iter()
+            .any(|pattern| matches_pattern(value, pattern)))
+        && !exclude
+            .iter()
+            .any(|pattern| matches_pattern(value, pattern))
+}
+
+fn matches_pattern(value: &str, pattern: &str) -> bool {
+    Pattern::new(pattern).map_or_else(|_| pattern == value, |glob| glob.matches(value))
 }
 
 fn render_changes(
@@ -614,6 +634,80 @@ not-json
             ResourceChange {
                 resource_type: "aws_instance".to_string(),
                 resource_name: "old".to_string(),
+                action: "delete".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            filter_changes(changes, &cli),
+            vec![ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn filters_resource_types_with_glob_patterns() {
+        let cli = Cli::parse_from([
+            "terraform_plan_parser",
+            "--include-type",
+            "aws_*",
+            "--exclude-type",
+            "*-bucket,*_s3_bucket",
+        ]);
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "google_compute_instance".to_string(),
+                resource_name: "app".to_string(),
+                action: "create".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            filter_changes(changes, &cli),
+            vec![ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn filters_actions_with_glob_patterns() {
+        let cli = Cli::parse_from([
+            "terraform_plan_parser",
+            "--include-action",
+            "cre*",
+            "--exclude-action",
+            "*-before",
+        ]);
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "old".to_string(),
+                action: "create-before".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
                 action: "delete".to_string(),
             },
         ];

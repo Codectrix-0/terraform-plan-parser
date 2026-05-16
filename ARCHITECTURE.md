@@ -15,7 +15,7 @@
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                    CLI Interface Layer                      │
-│  • Parse command-line arguments (directory path, --help)    │
+│  • Parse command-line arguments (paths, output, filters)    │
 │  • Validate directory exists and is a directory             │
 │  • Resolve absolute path (handles Windows relative paths)   │
 └──────────────────────┬──────────────────────────────────────┘
@@ -32,11 +32,17 @@
                        ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                   JSON Parsing Layer                        │
-│  • Stream-read live-plan stdout line-by-line or parse plan-file contents                          │
-│  • Parse each line as JSON via `serde_json`                 │
-│  • Extract: `change.resource.resource_type`                 │
-│           `change.resource.resource_name`                   │
-│           `change.action`                                   │
+│  • Stream-read live stdout or parse plan-file contents      │
+│  • Parse Terraform JSON via `serde_json`                    │
+│  • Extract resource type, resource name, and action         │
+└──────────────────────┬──────────────────────────────────────┘
+                       │
+                       ▼
+┌─────────────────────────────────────────────────────────────┐
+│                   Filtering Layer                           │
+│  • Apply include/exclude filters to type and action         │
+│  • Support exact values and glob wildcards (`*`, `?`)       │
+│  • Treat exclude matches as higher priority than includes   │
 └──────────────────────┬──────────────────────────────────────┘
                        │
                        ▼
@@ -68,6 +74,11 @@ Terraform Project Directory
                                                     │
                                                     ▼
                                             ┌───────────────┐
+                                            │ Glob Filters  │
+                                            └───────┬───────┘
+                                                    │
+                                                    ▼
+                                            ┌───────────────┐
                                             │  Stdout Render│
                                             │  (emoji + text)│
                                             └───────────────┘
@@ -78,8 +89,11 @@ Terraform Project Directory
 ```
 src/
 ├── main.rs              # Single-file application (no submodules)
-│   ├── print_help()     # CLI help text
-│   └── main()           # Entry point: args → validate → run → parse → render
+│   ├── Cli              # clap-derived CLI help and argument parsing
+│   ├── parse_*          # Terraform JSON deserialization helpers
+│   ├── filter_*         # include/exclude exact and glob matching
+│   ├── render_*         # text, JSON, CSV, and table output
+│   └── main()           # entry point: args → input → parse → filter → render
 ```
 
 > **Note:** The project is intentionally kept as a single-file CLI for simplicity. As features grow, consider splitting into:
@@ -97,6 +111,7 @@ src/
 | **Absolute path resolution** | Prevents Windows-specific issues where `.current_dir()` behaves unexpectedly with relative paths |
 | **Exit codes** | `0` = success (or no changes), `1` = error (invalid dir, terraform missing, plan failed) |
 | **No config file** | Zero-configuration tool; all behavior is deterministic |
+| **Glob filters** | Resource type and action filters support exact values plus wildcard patterns while preserving comma-separated CLI behavior |
 
 ## Dependencies
 
@@ -104,6 +119,8 @@ src/
 |-------|---------|
 | `serde` | Derive macros for JSON deserialization |
 | `serde_json` | Runtime JSON parsing |
+| `glob` | Wildcard pattern matching for include/exclude filters |
+| `clap` | Command-line parsing and help text generation |
 
 > `requirements.txt` exists for documentation/reference only. Actual dependency management is via `Cargo.toml`.
 
@@ -129,7 +146,7 @@ src/
 ## Future Extension Points
 
 1. **Structured output formats** — Add `--format json|csv|table` flags
-2. **Filtering** — `--include-type aws_instance` or `--exclude-action read`
+2. **Filtering enhancements** — expand beyond current glob support if resource names, modules, or tags become filter targets
 3. **Additional plan-source detection** — Keep expanding file/source handling while preserving `--plan-file` precedence
 4. **Pre-flight checks** — Validate Terraform version compatibility
 5. **CI/CD integration** — Exit with different codes for `create` vs `delete` actions
@@ -142,5 +159,5 @@ src/
 | Language | Rust (Edition 2021) |
 | JSON Parsing | serde + serde_json |
 | Process Spawning | std::process::Command |
-| CLI Args | std::env::args (manual parsing) |
+| CLI Args | clap derive parser |
 | Target Platforms | Windows, macOS, Linux |

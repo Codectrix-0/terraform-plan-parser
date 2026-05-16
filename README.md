@@ -7,6 +7,7 @@ A lightweight Rust CLI tool that parses Terraform plan JSON output and displays 
 - **Colorful summary** — see at a glance what's being created (➕), updated (🔄), deleted (➖), or read (📖)
 - **Directory-aware** — point it at any Terraform project directory to run `terraform plan -json`
 - **Plan-file aware** — parse pre-generated NDJSON/full JSON plan files with `--plan-file`, or inspect saved `.tfplan` files through `terraform show -json`
+- **Flexible filtering** — narrow results with comma-separated exact or glob patterns such as `--include-type aws_*`, `--exclude-type *_bucket`, or `--include-action cre*`
 - **Zero config** — just run it
 - **Cross-platform** — works on Windows, macOS, and Linux
 
@@ -56,6 +57,31 @@ terraform_plan_parser saved.tfplan
 
 `--plan-file` takes precedence if both a positional directory/file and `--plan-file` are provided.
 
+## Filtering
+
+Filter flags accept comma-separated values. Exact matches remain supported, and each value may also be a glob pattern using wildcards such as `*` and `?`. Include filters are applied first, then matching exclude filters remove resources from the result.
+
+```bash
+# Include only AWS resource types
+terraform_plan_parser . --include-type 'aws_*'
+
+# Include instance-like resources while hiding bucket resources
+terraform_plan_parser . --include-type '*instance' --exclude-type '*_bucket'
+
+# Action filters also accept glob patterns
+terraform_plan_parser . --include-action 'cre*' --exclude-action 'no*'
+
+# Multiple patterns can be comma-separated
+terraform_plan_parser . --include-type 'aws_*,google_*' --exclude-action 'delete,replace'
+```
+
+Available filter flags:
+
+- `--include-type GLOB[,GLOB]...`
+- `--exclude-type GLOB[,GLOB]...`
+- `--include-action GLOB[,GLOB]...`
+- `--exclude-action GLOB[,GLOB]...`
+
 ## Architecture
 
-See [Architecture Notes](docs/architecture.md) for system architecture, data flow, design decisions, and future extension points.
+See [Architecture Notes](ARCHITECTURE.md) for system architecture, data flow, design decisions, and future extension points.
