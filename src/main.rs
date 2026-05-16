@@ -1,5 +1,35 @@
-use serde_json::Value;
+use serde::Deserialize;
 use std::{env, path::Path, process::Command};
+
+#[derive(Debug, PartialEq, Eq)]
+struct ResourceChange {
+    resource_type: String,
+    resource_name: String,
+    action: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanLine {
+    change: Option<PlanChange>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanChange {
+    resource: Option<PlanResource>,
+    action: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanResource {
+    #[serde(default = "unknown_value")]
+    resource_type: String,
+    #[serde(default = "unknown_value")]
+    resource_name: String,
+}
+
+fn unknown_value() -> String {
+    "unknown".to_string()
+}
 
 fn print_help() {
     println!("terraform_plan_parser - summarize terraform plan -json output\n");
@@ -7,6 +37,23 @@ fn print_help() {
     println!("  terraform_plan_parser [DIRECTORY]\n");
     println!("Options:");
     println!("  -h, --help    Show this help message");
+}
+
+fn parse_plan_output(stdout: &str) -> Vec<ResourceChange> {
+    stdout
+        .lines()
+        .filter_map(|line| serde_json::from_str::<PlanLine>(line).ok())
+        .filter_map(|line| {
+            let change = line.change?;
+            let resource = change.resource?;
+
+            Some(ResourceChange {
+                resource_type: resource.resource_type,
+                resource_name: resource.resource_name,
+                action: change.action.unwrap_or_else(|| "noop".to_string()),
+            })
+        })
+        .collect()
 }
 
 fn main() {
@@ -99,14 +146,63 @@ fn main() {
     }
 
     println!("📊 Planned changes in '{}':", abs_dir.display());
-    for (res_type, res_name, action) in resource_changes {
-        let symbol = match action.as_str() {
+    for change in resource_changes {
+        let symbol = match change.action.as_str() {
             "create" => "➕",
             "update" => "🔄",
             "delete" => "➖",
             "read" => "📖",
             _ => "•",
         };
-        println!("{} {} {} ({})", symbol, res_type, res_name, action);
+        println!(
+            "{} {} {} ({})",
+            symbol, change.resource_type, change.resource_name, change.action
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_plan_output, ResourceChange};
+
+    #[test]
+    fn parses_resource_changes_from_ndjson() {
+        let stdout = r#"{"@level":"info","change":{"resource":{"resource_type":"aws_instance","resource_name":"web"},"action":"create"}}
+not-json
+{"@level":"info","change":{"resource":{"resource_type":"aws_s3_bucket","resource_name":"logs"},"action":"delete"}}
+"#;
+
+        assert_eq!(
+            parse_plan_output(stdout),
+            vec![
+                ResourceChange {
+                    resource_type: "aws_instance".to_string(),
+                    resource_name: "web".to_string(),
+                    action: "create".to_string(),
+                },
+                ResourceChange {
+                    resource_type: "aws_s3_bucket".to_string(),
+                    resource_name: "logs".to_string(),
+                    action: "delete".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_lines_without_resource_changes() {
+        let stdout = r#"{"@level":"info","message":"Refreshing state..."}
+{"change":{"action":"create"}}
+{"change":{"resource":{"resource_type":"aws_instance","resource_name":"web"}}}
+"#;
+
+        assert_eq!(
+            parse_plan_output(stdout),
+            vec![ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "noop".to_string(),
+            }]
+        );
     }
 }
