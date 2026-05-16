@@ -1,7 +1,26 @@
-use serde::Deserialize;
-use std::{env, path::Path, process::Command};
+use clap::Parser;
+use serde::{Deserialize, Serialize};
+use std::{path::Path, process::Command};
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Parser)]
+#[command(name = "terraform_plan_parser")]
+struct Cli {
+    #[arg(default_value = ".")]
+    directory: String,
+    #[arg(long, value_enum, default_value = "text")]
+    format: Format,
+    #[arg(long)]
+    no_emoji: bool,
+}
+
+#[derive(clap::ValueEnum, Clone, Debug)]
+enum Format {
+    Text,
+    Json,
+    Csv,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize)]
 struct ResourceChange {
     resource_type: String,
     resource_name: String,
@@ -10,12 +29,12 @@ struct ResourceChange {
 
 #[derive(Debug, Deserialize)]
 struct PlanLine {
-    change: Option<PlanChange>,
+    change: Option<<PlanChange>,
 }
 
 #[derive(Debug, Deserialize)]
 struct PlanChange {
-    resource: Option<PlanResource>,
+    resource: Option<<PlanResource>,
     action: Option<String>,
 }
 
@@ -26,38 +45,6 @@ struct PlanResource {
     #[serde(default = "unknown_value")]
     resource_name: String,
 }
-
-fn unknown_value() -> String {
-    "unknown".to_string()
-}
-
-fn print_help() {
-    println!("terraform_plan_parser - summarize terraform plan -json output\n");
-    println!("Usage:");
-    println!("  terraform_plan_parser [DIRECTORY]\n");
-    println!("Options:");
-    println!("  -h, --help    Show this help message");
-}
-
-fn parse_plan_output(stdout: &str) -> Vec<ResourceChange> {
-    stdout
-        .lines()
-        .filter_map(|line| serde_json::from_str::<PlanLine>(line).ok())
-        .filter_map(|line| {
-            let change = line.change?;
-            let resource = change.resource?;
-
-            Some(ResourceChange {
-                resource_type: resource.resource_type,
-                resource_name: resource.resource_name,
-                action: change.action.unwrap_or_else(|| "noop".to_string()),
-            })
-        })
-        .collect()
-}
-
-fn main() {
-    let args: Vec<String> = env::args().collect();
 
 fn unknown_value() -> String {
     "unknown".to_string()
@@ -165,13 +152,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Get absolute path to avoid Windows relative-path issues with .current_dir()
     let abs_dir = std::env::current_dir()
         .unwrap_or_else(|_| Path::new(".").to_path_buf())
         .join(path);
     let abs_dir = abs_dir.canonicalize().unwrap_or(abs_dir);
 
-    // Verify terraform is available
     if Command::new("terraform").arg("version").output().is_err() {
         eprintln!("Error: 'terraform' not found in PATH. Is Terraform installed?");
         std::process::exit(1);
@@ -204,55 +189,13 @@ fn main() {
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut resource_changes = Vec::new();
-
-    for line in stdout.lines() {
-        if let Ok(json) = serde_json::from_str::<Value>(line) {
-            if let Some(change) = json.get("change") {
-                if let Some(resource) = change.get("resource") {
-                    let resource_type = resource["resource_type"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let resource_name = resource["resource_name"]
-                        .as_str()
-                        .unwrap_or("unknown")
-                        .to_string();
-                    let action = change["action"].as_str().unwrap_or("noop").to_string();
-
-                    resource_changes.push((resource_type, resource_name, action));
-                }
-            }
-        }
-    }
-
-    if resource_changes.is_empty() {
-        println!(
-            "✅ No resource changes detected in '{}'.",
-            abs_dir.display()
-        );
-        return;
-    }
-
-    println!("📊 Planned changes in '{}':", abs_dir.display());
-    for change in resource_changes {
-        let symbol = match change.action.as_str() {
-            "create" => "➕",
-            "update" => "🔄",
-            "delete" => "➖",
-            "read" => "📖",
-            _ => "•",
-        };
-        println!(
-            "{} {} {} ({})",
-            symbol, change.resource_type, change.resource_name, change.action
-        );
-    }
+    let resource_changes = parse_plan_output(&stdout);
+    render_changes(&resource_changes, &abs_dir, &cli.format, cli.no_emoji);
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_plan_output, ResourceChange};
+    use super::{csv_escape, parse_plan_output, ResourceChange};
 
     #[test]
     fn parses_resource_changes_from_ndjson() {
@@ -293,5 +236,12 @@ not-json
                 action: "noop".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn escapes_csv_fields_that_need_quotes() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("name,with,commas"), "\"name,with,commas\"");
+        assert_eq!(csv_escape("name \"quoted\""), "\"name \"\"quoted\"\"\"");
     }
 }
