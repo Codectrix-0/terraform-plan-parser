@@ -391,7 +391,13 @@ fn render_text(
     ));
     for change in resource_changes {
         let symbol = if no_emoji {
-            ""
+            match change.action.as_str() {
+                "create" => "+ ",
+                "update" => "~ ",
+                "delete" => "- ",
+                "read" => "? ",
+                _ => "* ",
+            }
         } else {
             match change.action.as_str() {
                 "create" => "➕ ",
@@ -924,6 +930,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
+        app_settings, csv_escape, filter_changes, parse_plan_output, render_csv, render_dry_run,
+        render_table, render_text, Cli, ConfigFile, Format, ResourceChange, TerraformInput,
         app_settings, count_actions, csv_escape, filter_changes, parse_plan_output, render_csv,
         render_dry_run, render_summary_line, render_table, render_text, ChangeCounts, Cli,
         ConfigFile, Format, ResourceChange, TerraformInput,
