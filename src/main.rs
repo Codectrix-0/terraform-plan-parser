@@ -57,17 +57,17 @@ impl std::io::Write for OutputWriter {
     name = "terraform_plan_parser",
     version = env!("CARGO_PKG_VERSION"),
     after_help = r#"EXAMPLES:
-  # Parse a saved JSON plan file
-  terraform_plan_parser . --plan-file plan.ndjson --format csv
+    # Parse a saved JSON plan file
+    terraform_plan_parser . --plan-file plan.ndjson --format csv
 
-  # Read plan JSON from stdin
-  cat plan.ndjson | terraform_plan_parser . --format table
+    # Read plan JSON from stdin
+    cat plan.ndjson | terraform_plan_parser . --format table
 
-  # Filter to create actions only
-  terraform_plan_parser . --plan-file plan.ndjson --include-action create
+    # Filter to create actions only
+    terraform_plan_parser . --plan-file plan.ndjson --include-action create
 
-  # Install shell completions (bash example)
-  terraform_plan_parser --completions bash > /etc/bash_completion.d/terraform_plan_parser
+    # Install shell completions (bash example)
+    terraform_plan_parser --completions bash > /etc/bash_completion.d/terraform_plan_parser
 "#
 )]
 struct Cli {
@@ -134,9 +134,6 @@ struct Cli {
     #[arg(short = 'r', long)]
     only_replace: bool,
 
-    /// Shorthand to include only replace actions.
-    #[arg(short = 'r', long)]
-
     /// Exclude actions matching these comma-separated glob patterns.
     #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     exclude_action: Vec<String>,
@@ -191,6 +188,9 @@ struct ConfigFile {
     exclude_type: Vec<String>,
     include_action: Vec<String>,
     only_delete: Option<bool>,
+    only_create: Option<bool>,
+    only_update: Option<bool>,
+    only_replace: Option<bool>,
     exclude_action: Vec<String>,
     fail_on: Vec<String>,
     github_summary: Option<bool>,
@@ -213,6 +213,7 @@ struct AppSettings {
     fail_on: Vec<String>,
     github_summary: bool,
     sort_by: Option<SortBy>,
+    only_replace: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -391,7 +392,6 @@ fn sort_resource_changes(changes: &mut [ResourceChange], sort_by: Option<SortBy>
     });
 }
 
-
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ChangeCounts {
     create: usize,
@@ -427,7 +427,7 @@ fn summary_action_symbols(no_emoji: bool) -> (&'static str, &'static str, &'stat
 fn render_summary_line(counts: &ChangeCounts, no_emoji: bool) -> String {
     let (create_sym, update_sym, delete_sym) = summary_action_symbols(no_emoji);
     format!(
-        "Summary:\n  {create_sym} {} to create\n  {update_sym} {} to update\n  {delete_sym} {} to delete\n",
+        "Summary:\n {create_sym} {} to create\n {update_sym} {} to update\n {delete_sym} {} to delete\n",
         counts.create, counts.update, counts.delete
     )
 }
@@ -665,25 +665,22 @@ fn render_table(
 
     let mut output = format!("Planned changes in '{}':\n", abs_path.display());
     output.push_str(&format!(
-        "{:<type_width$}  {:<name_width$}  {:<action_width$}\n",
+        "{:type_width$}  {:name_width$}  {:action_width$}\n",
         "Resource Type", "Resource Name", "Action"
     ));
     output.push_str(&format!(
         "{:-<type_width$}  {:-<name_width$}  {:-<action_width$}\n",
         "", "", ""
     ));
-
     for change in resource_changes {
         output.push_str(&format!(
-            "{:<type_width$}  {:<name_width$}  {:<action_width$}\n",
+            "{:type_width$}  {:name_width$}  {:action_width$}\n",
             change.resource_type, change.resource_name, change.action
         ));
     }
-
     if !quiet {
         output.push_str(&render_summary_line(counts, no_emoji));
     }
-
     output
 }
 
@@ -871,8 +868,7 @@ fn resolve_plan_file_input(path: &Path) -> Result<TerraformInput, String> {
     if !path.exists() {
         return Err(format!(
             "Error: plan file not found at \"{}\"\n\
-             Hint: check the path and ensure the file exists, or run \
-             `terraform plan -json > plan.json` in your project directory.",
+            Hint: check the path and ensure the file exists, or run \n            \`terraform plan -json > plan.json\` in your project directory.",
             path.display()
         ));
     }
@@ -881,7 +877,7 @@ fn resolve_plan_file_input(path: &Path) -> Result<TerraformInput, String> {
     if !abs_path.is_file() {
         return Err(format!(
             "Error: --plan-file path is not a file: \"{}\"\n\
-             Hint: pass a JSON/NDJSON plan file or a saved .tfplan file.",
+            Hint: pass a JSON/NDJSON plan file or a saved .tfplan file.",
             path.display()
         ));
     }
@@ -943,7 +939,7 @@ fn render_dry_run(input: &TerraformInput) -> String {
                 .to_string()
         }
         TerraformInput::Directory(directory) => format!(
-            "Dry run: would execute `terraform plan -json -input=false -no-color` in '{}'.\n",
+            "Dry run: would execute \`terraform plan -json -input=false -no-color\` in '{}'.\n",
             directory.display()
         ),
         TerraformInput::JsonPlanFile(plan_file) => format!(
@@ -953,7 +949,7 @@ fn render_dry_run(input: &TerraformInput) -> String {
         TerraformInput::BinaryPlanFile(plan_file) => {
             let current_dir = plan_file.parent().unwrap_or_else(|| Path::new("."));
             format!(
-                "Dry run: would execute `terraform show -json {}` in '{}'.\n",
+                "Dry run: would execute \`terraform show -json {}\` in '{}'.\n",
                 plan_file.display(),
                 current_dir.display()
             )
@@ -1130,7 +1126,7 @@ fn main() {
     });
     let mut resource_changes = filter_changes(resource_changes, &settings);
     sort_resource_changes(&mut resource_changes, settings.sort_by);
-    let stdin_display_path = Path::new("<stdin>");
+    let stdin_display_path = Path::new("");
     let display_path = match &input {
         TerraformInput::StdinJson(_) => stdin_display_path,
         TerraformInput::Directory(directory) => directory.as_path(),
@@ -1199,18 +1195,18 @@ not-json
     #[test]
     fn parses_saved_plan_json_output() {
         let stdout = r#"{
-  "resource_changes": [
-    {
-      "type": "aws_instance",
-      "name": "web",
-      "change": { "actions": ["delete", "create"] }
-    },
-    {
-      "type": "aws_s3_bucket",
-      "name": "logs",
-      "change": { "actions": ["no-op"] }
-    }
-  ]
+    "resource_changes": [
+        {
+            "type": "aws_instance",
+            "name": "web",
+            "change": { "actions": ["delete", "create"] }
+        },
+        {
+            "type": "aws_s3_bucket",
+            "name": "logs",
+            "change": { "actions": ["no-op"] }
+        }
+    ]
 }"#;
 
         assert_eq!(
@@ -1548,7 +1544,7 @@ not-json
         );
         assert_eq!(
             render_summary_line(&count_actions(&changes), true),
-            "Summary:\n  + 2 to create\n  ~ 1 to update\n  - 1 to delete\n"
+            "Summary:\n + 2 to create\n ~ 1 to update\n - 1 to delete\n"
         );
     }
 
@@ -1607,7 +1603,6 @@ not-json
     }
 
     #[test]
-    #[test]
     fn sorts_resource_changes_by_type() {
         let mut changes = vec![
             ResourceChange {
@@ -1647,7 +1642,7 @@ not-json
 
         assert_eq!(
             output,
-            "Dry run: would execute `terraform plan -json -input=false -no-color` in '/tmp/project'.\n"
+            "Dry run: would execute \`terraform plan -json -input=false -no-color\` in '/tmp/project'.\n"
         );
     }
 
@@ -1659,7 +1654,7 @@ not-json
 
         assert_eq!(
             output,
-            "Dry run: would execute `terraform show -json /tmp/project/tfplan` in '/tmp/project'.\n"
+            "Dry run: would execute \`terraform show -json /tmp/project/tfplan\` in '/tmp/project'.\n"
         );
     }
 
@@ -1723,7 +1718,7 @@ not-json
         let summary = render_github_step_summary(Path::new("plan.ndjson"), &changes, &counts, true);
 
         assert!(summary.contains("## Terraform plan summary"));
-        assert!(summary.contains("**Plan:** `plan.ndjson`"));
+        assert!(summary.contains("**Plan:** \`plan.ndjson\`"));
         assert!(summary.contains("| + Create | 1 |"));
         assert!(summary.contains("| create | aws_instance | web |"));
     }
