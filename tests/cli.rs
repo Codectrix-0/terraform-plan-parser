@@ -586,3 +586,35 @@ fn prints_version_flag() {
         concat!("terraform_plan_parser ", env!("CARGO_PKG_VERSION"))
     );
 }
+
+const REPLACE_ACTIONS_PLAN: &str = r#"{"@level":"info","@message":"Plan: 1 to add, 0 to change, 0 to destroy.","@module":"terraform.ui","change":{"action":"create","resource":{"addr":"aws_instance.web","module":"","resource":"aws_instance","implied_provider":"aws","resource_type":"aws_instance","resource_name":"web","resource_key":null}},"type":"planned_change"}
+{"@level":"info","@message":"Plan: 0 to add, 1 to change, 0 to destroy.","@module":"terraform.ui","change":{"action":"replace","resource":{"addr":"aws_s3_bucket.logs","module":"","resource":"aws_s3_bucket","implied_provider":"aws","resource_type":"aws_s3_bucket","resource_name":"logs","resource_key":null}},"type":"planned_change"}
+{"@level":"info","@message":"Plan: 0 to add, 0 to change, 1 to destroy.","@module":"terraform.ui","change":{"action":"delete","resource":{"addr":"aws_rds_cluster.db","module":"","resource":"aws_rds_cluster","implied_provider":"aws","resource_type":"aws_rds_cluster","resource_name":"db","resource_key":null}},"type":"planned_change"}"#;
+
+#[test]
+fn only_replace_shorthand_filters_replace_actions() {
+    let root = temp_dir("only_replace_shorthand");
+    let plan_file = root.join("plan.ndjson");
+    fs::write(&plan_file, REPLACE_ACTIONS_PLAN).expect("write plan fixture");
+    let output = Command::new(env!("CARGO_BIN_EXE_terraform_plan_parser"))
+        .arg(".")
+        .current_dir(&root)
+        .arg("--plan-file")
+        .arg("plan.ndjson")
+        .arg("--format")
+        .arg("csv")
+        .arg("-r")
+        .env("PATH", "")
+        .output()
+        .expect("run terraform_plan_parser");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "resource_type,resource_name,action\naws_s3_bucket,logs,replace\n"
+    );
+    fs::remove_dir_all(root).expect("remove temp dir");
+}

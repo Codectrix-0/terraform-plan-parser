@@ -129,6 +129,14 @@ struct Cli {
     /// Shorthand to include only update actions.
     #[arg(short = 'u', long)]
     only_update: bool,
+
+    /// Shorthand to include only replace actions.
+    #[arg(short = 'r', long)]
+    only_replace: bool,
+
+    /// Shorthand to include only replace actions.
+    #[arg(short = 'r', long)]
+
     /// Exclude actions matching these comma-separated glob patterns.
     #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     exclude_action: Vec<String>,
@@ -767,6 +775,9 @@ fn resolve_include_action(cli: &Cli, config: &ConfigFile) -> Vec<String> {
     if cli.only_update {
         return vec!["update".to_string()];
     }
+    if cli.only_replace {
+        return vec!["replace".to_string()];
+    }
     cli_or_config_values(&cli.include_action, config.include_action.clone())
 }
 
@@ -793,6 +804,7 @@ fn app_settings(cli: &Cli, config: ConfigFile, config_path: Option<&Path>) -> Ap
         fail_on: cli_or_config_values(&cli.fail_on, config.fail_on),
         github_summary: cli.github_summary || config.github_summary.unwrap_or(false),
         sort_by: cli.sort_by.or(config.sort_by),
+        only_replace: cli.only_replace || config.only_replace.unwrap_or(false),
     }
 }
 
