@@ -380,6 +380,8 @@ const MIXED_ACTIONS_PLAN: &str = r#"{"@level":"info","change":{"resource":{"reso
 "#;
 
 #[test]
+fn filters_only_update_actions() {
+    let root = temp_dir("filter_update_actions");
 fn excludes_actions_even_when_included() {
     let root = temp_dir("filter_exclude_actions");
     let plan_file = root.join("plan.ndjson");
@@ -394,6 +396,7 @@ fn excludes_actions_even_when_included() {
         .arg("--format")
         .arg("csv")
         .arg("--include-action")
+        .arg("update")
         .arg("create,update,delete")
         .arg("--exclude-action")
         .arg("delete")
@@ -405,6 +408,10 @@ fn excludes_actions_even_when_included() {
         output.status.success(),
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "resource_type,resource_name,action\naws_s3_bucket,logs,update\n"
     );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
