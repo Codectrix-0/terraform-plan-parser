@@ -1167,10 +1167,10 @@ not-json
 
     #[test]
     fn accepts_table_format_from_cli() {
-        let cli = Cli::parse_from([
-    "terraform_plan_parser",
-    "--format",
-    "table",
+       let cli = Cli::parse_from([
+        "terraform_plan_parser",
+        "--format",
+        "table",
 ]);
         assert!(matches!(cli.format, Some(Format::Table)));
     }
