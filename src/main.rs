@@ -1,4 +1,5 @@
-use clap::Parser;
+use clap::{CommandFactory, Parser};
+use clap_complete::Shell;
 use glob::Pattern;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -52,7 +53,23 @@ impl std::io::Write for OutputWriter {
 }
 
 #[derive(Parser)]
-#[command(name = "terraform_plan_parser")]
+#[command(
+    name = "terraform_plan_parser",
+    version = env!("CARGO_PKG_VERSION"),
+    after_help = r#"EXAMPLES:
+    # Parse a saved JSON plan file
+    terraform_plan_parser . --plan-file plan.ndjson --format csv
+
+    # Read plan JSON from stdin
+    cat plan.ndjson | terraform_plan_parser . --format table
+
+    # Filter to create actions only
+    terraform_plan_parser . --plan-file plan.ndjson --include-action create
+
+    # Install shell completions (bash example)
+    terraform_plan_parser --completions bash > /etc/bash_completion.d/terraform_plan_parser
+"#
+)]
 struct Cli {
     /// Terraform project directory or saved .tfplan file to inspect.
     #[arg(default_value = ".")]
@@ -80,6 +97,12 @@ struct Cli {
     /// Enable verbose diagnostic logging.
     #[arg(short, long)]
     verbose: bool,
+    /// Suppress the action summary line at the end of text/table output.
+    #[arg(short, long)]
+    quiet: bool,
+    /// Omit the header row from CSV output.
+    #[arg(long)]
+    no_header: bool,
     /// Include only resource types matching these comma-separated glob patterns.
     ///
     /// Exact values still work, and wildcards such as `aws_*` or `*instance`
@@ -95,9 +118,41 @@ struct Cli {
     /// Include only actions matching these comma-separated glob patterns.
     #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     include_action: Vec<String>,
+    /// Shorthand for `--include-action delete` (safety reviews).
+    #[arg(short = 'd', long)]
+    only_delete: bool,
+
+    /// Shorthand to include only create actions.
+    #[arg(short = 'c', long)]
+    only_create: bool,
+
+    /// Shorthand to include only update actions.
+    #[arg(short = 'u', long)]
+    only_update: bool,
+    /// Shorthand to include only replace actions.
+    #[arg(short = 'r', long)]
+    only_replace: bool,
     /// Exclude actions matching these comma-separated glob patterns.
     #[arg(long, value_delimiter = ',', value_name = "GLOB[,GLOB]...")]
     exclude_action: Vec<String>,
+    /// Exit with a non-zero status when the plan contains any of these actions.
+    ///
+    /// Evaluated after filters are applied. Useful in CI to block destructive plans:
+    /// terraform_plan_parser . --fail-on delete
+    #[arg(long, value_delimiter = ',', value_name = "ACTION[,ACTION]...")]
+    fail_on: Vec<String>,
+    /// Append a Markdown plan summary to `$GITHUB_STEP_SUMMARY` when that variable is set.
+    ///
+    /// In GitHub Actions the summary is written automatically when the environment
+    /// variable is present; pass this flag to require an explicit opt-in.
+    #[arg(long)]
+    github_summary: bool,
+    /// Sort resource changes before rendering (default: plan file order).
+    #[arg(long, value_enum)]
+    sort_by: Option<SortBy>,
+    /// Generate shell completion scripts for the given shell, then exit.
+    #[arg(long, value_enum, value_name = "SHELL")]
+    completions: Option<Shell>,
 }
 
 #[derive(clap::ValueEnum, Clone, Debug, Deserialize)]
@@ -109,6 +164,14 @@ enum Format {
     Table,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+enum SortBy {
+    Type,
+    Name,
+    Action,
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
 struct ConfigFile {
@@ -117,10 +180,19 @@ struct ConfigFile {
     no_emoji: Option<bool>,
     dry_run: Option<bool>,
     verbose: Option<bool>,
+    quiet: Option<bool>,
+    no_header: Option<bool>,
     include_type: Vec<String>,
     exclude_type: Vec<String>,
     include_action: Vec<String>,
+    only_delete: Option<bool>,
+    only_create: Option<bool>,
+    only_update: Option<bool>,
+    only_replace: Option<bool>,
     exclude_action: Vec<String>,
+    fail_on: Vec<String>,
+    github_summary: Option<bool>,
+    sort_by: Option<SortBy>,
 }
 
 #[derive(Debug)]
@@ -130,10 +202,15 @@ struct AppSettings {
     no_emoji: bool,
     dry_run: bool,
     verbose: bool,
+    quiet: bool,
+    no_header: bool,
     include_type: Vec<String>,
     exclude_type: Vec<String>,
     include_action: Vec<String>,
     exclude_action: Vec<String>,
+    fail_on: Vec<String>,
+    github_summary: bool,
+    sort_by: Option<SortBy>,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -289,21 +366,191 @@ fn matches_pattern(value: &str, pattern: &str) -> bool {
     Pattern::new(pattern).map_or_else(|_| pattern == value, |glob| glob.matches(value))
 }
 
+fn sort_resource_changes(changes: &mut [ResourceChange], sort_by: Option<SortBy>) {
+    let Some(sort_by) = sort_by else {
+        return;
+    };
+    changes.sort_by(|left, right| match sort_by {
+        SortBy::Type => left
+            .resource_type
+            .cmp(&right.resource_type)
+            .then_with(|| left.resource_name.cmp(&right.resource_name))
+            .then_with(|| left.action.cmp(&right.action)),
+        SortBy::Name => left
+            .resource_name
+            .cmp(&right.resource_name)
+            .then_with(|| left.resource_type.cmp(&right.resource_type))
+            .then_with(|| left.action.cmp(&right.action)),
+        SortBy::Action => left
+            .action
+            .cmp(&right.action)
+            .then_with(|| left.resource_type.cmp(&right.resource_type))
+            .then_with(|| left.resource_name.cmp(&right.resource_name)),
+    });
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ChangeCounts {
+    create: usize,
+    update: usize,
+    delete: usize,
+}
+
+fn count_actions(resource_changes: &[ResourceChange]) -> ChangeCounts {
+    let mut counts = ChangeCounts::default();
+    for change in resource_changes {
+        match change.action.as_str() {
+            "create" => counts.create += 1,
+            "update" => counts.update += 1,
+            "delete" => counts.delete += 1,
+            "replace" => {
+                counts.create += 1;
+                counts.delete += 1;
+            }
+            _ => {}
+        }
+    }
+    counts
+}
+
+fn summary_action_symbols(no_emoji: bool) -> (&'static str, &'static str, &'static str) {
+    if no_emoji {
+        ("+", "~", "-")
+    } else {
+        ("➕", "🔄", "➖")
+    }
+}
+
+fn render_summary_line(counts: &ChangeCounts, no_emoji: bool) -> String {
+    let (create_sym, update_sym, delete_sym) = summary_action_symbols(no_emoji);
+    format!(
+        "Summary:\n {create_sym} {} to create\n {update_sym} {} to update\n {delete_sym} {} to delete\n",
+        counts.create, counts.update, counts.delete
+    )
+}
+
+fn render_github_step_summary(
+    display_path: &Path,
+    resource_changes: &[ResourceChange],
+    counts: &ChangeCounts,
+    no_emoji: bool,
+) -> String {
+    use std::fmt::Write;
+
+    let (create_sym, update_sym, delete_sym) = summary_action_symbols(no_emoji);
+    let mut output = String::new();
+    writeln!(output, "## Terraform plan summary").unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "**Plan:** `{}`", display_path.display()).unwrap();
+    writeln!(output).unwrap();
+    writeln!(output, "| | Count |").unwrap();
+    writeln!(output, "| --- | ---: |").unwrap();
+    writeln!(output, "| {create_sym} Create | {} |", counts.create).unwrap();
+    writeln!(output, "| {update_sym} Update | {} |", counts.update).unwrap();
+    writeln!(output, "| {delete_sym} Delete | {} |", counts.delete).unwrap();
+
+    if !resource_changes.is_empty() {
+        writeln!(output).unwrap();
+        writeln!(output, "### Resource changes").unwrap();
+        writeln!(output).unwrap();
+        writeln!(output, "| Action | Type | Name |").unwrap();
+        writeln!(output, "| --- | --- | --- |").unwrap();
+        for change in resource_changes {
+            writeln!(
+                output,
+                "| {} | {} | {} |",
+                change.action, change.resource_type, change.resource_name
+            )
+            .unwrap();
+        }
+    }
+
+    output
+}
+
+fn append_github_step_summary(
+    summary_path: &str,
+    display_path: &Path,
+    resource_changes: &[ResourceChange],
+    counts: &ChangeCounts,
+    no_emoji: bool,
+) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let markdown = render_github_step_summary(display_path, resource_changes, counts, no_emoji);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(summary_path)?;
+    if file.metadata()?.len() > 0 {
+        writeln!(file)?;
+    }
+    write!(file, "{markdown}")?;
+    if !markdown.ends_with('\n') {
+        writeln!(file)?;
+    }
+    Ok(())
+}
+
+fn should_write_github_summary(settings: &AppSettings) -> bool {
+    std::env::var_os("GITHUB_STEP_SUMMARY").is_some() || settings.github_summary
+}
+
+fn write_github_summary_if_enabled(
+    settings: &AppSettings,
+    display_path: &Path,
+    resource_changes: &[ResourceChange],
+) {
+    if !should_write_github_summary(settings) {
+        return;
+    }
+
+    let Some(summary_path) = std::env::var_os("GITHUB_STEP_SUMMARY") else {
+        if settings.github_summary {
+            tracing::warn!(
+                "--github-summary was set but GITHUB_STEP_SUMMARY is not set; skipping summary"
+            );
+        }
+        return;
+    };
+
+    let summary_path = summary_path.to_string_lossy();
+    let counts = count_actions(resource_changes);
+    if let Err(error) = append_github_step_summary(
+        &summary_path,
+        display_path,
+        resource_changes,
+        &counts,
+        settings.no_emoji,
+    ) {
+        tracing::warn!("Failed to write GitHub Actions summary: {error}");
+    }
+}
+
 fn render_changes(
     resource_changes: &[ResourceChange],
     abs_path: &Path,
     format: &Format,
     no_emoji: bool,
+    quiet: bool,
+    no_header: bool,
 ) -> String {
+    let counts = count_actions(resource_changes);
     match format {
-        Format::Text => render_text(resource_changes, abs_path, no_emoji),
+        Format::Text => render_text(resource_changes, abs_path, no_emoji, quiet, &counts),
         Format::Json => render_json(resource_changes),
-        Format::Csv => render_csv(resource_changes),
-        Format::Table => render_table(resource_changes, abs_path),
+        Format::Csv => render_csv(resource_changes, no_header),
+        Format::Table => render_table(resource_changes, abs_path, no_emoji, quiet, &counts),
     }
 }
 
-fn render_text(resource_changes: &[ResourceChange], abs_path: &Path, no_emoji: bool) -> String {
+fn render_text(
+    resource_changes: &[ResourceChange],
+    abs_path: &Path,
+    no_emoji: bool,
+    quiet: bool,
+    counts: &ChangeCounts,
+) -> String {
     let mut output = String::new();
     if resource_changes.is_empty() {
         let prefix = if no_emoji { "" } else { "✅ " };
@@ -312,6 +559,9 @@ fn render_text(resource_changes: &[ResourceChange], abs_path: &Path, no_emoji: b
             prefix,
             abs_path.display()
         ));
+        if !quiet {
+            output.push_str(&render_summary_line(counts, no_emoji));
+        }
         return output;
     }
 
@@ -323,7 +573,13 @@ fn render_text(resource_changes: &[ResourceChange], abs_path: &Path, no_emoji: b
     ));
     for change in resource_changes {
         let symbol = if no_emoji {
-            ""
+            match change.action.as_str() {
+                "create" => "+ ",
+                "update" => "~ ",
+                "delete" => "- ",
+                "read" => "? ",
+                _ => "* ",
+            }
         } else {
             match change.action.as_str() {
                 "create" => "➕ ",
@@ -338,6 +594,9 @@ fn render_text(resource_changes: &[ResourceChange], abs_path: &Path, no_emoji: b
             symbol, change.resource_type, change.resource_name, change.action
         ));
     }
+    if !quiet {
+        output.push_str(&render_summary_line(counts, no_emoji));
+    }
     output
 }
 
@@ -348,8 +607,11 @@ fn render_json(resource_changes: &[ResourceChange]) -> String {
     )
 }
 
-fn render_csv(resource_changes: &[ResourceChange]) -> String {
-    let mut output = String::from("resource_type,resource_name,action\n");
+fn render_csv(resource_changes: &[ResourceChange], no_header: bool) -> String {
+    let mut output = String::new();
+    if !no_header {
+        output.push_str("resource_type,resource_name,action\n");
+    }
     for change in resource_changes {
         output.push_str(&format!(
             "{},{},{}\n",
@@ -361,12 +623,22 @@ fn render_csv(resource_changes: &[ResourceChange]) -> String {
     output
 }
 
-fn render_table(resource_changes: &[ResourceChange], abs_path: &Path) -> String {
+fn render_table(
+    resource_changes: &[ResourceChange],
+    abs_path: &Path,
+    no_emoji: bool,
+    quiet: bool,
+    counts: &ChangeCounts,
+) -> String {
     if resource_changes.is_empty() {
-        return format!(
+        let mut output = format!(
             "No resource changes detected in '{}'.\n",
             abs_path.display()
         );
+        if !quiet {
+            output.push_str(&render_summary_line(counts, no_emoji));
+        }
+        return output;
     }
 
     let type_width = resource_changes
@@ -390,21 +662,22 @@ fn render_table(resource_changes: &[ResourceChange], abs_path: &Path) -> String 
 
     let mut output = format!("Planned changes in '{}':\n", abs_path.display());
     output.push_str(&format!(
-        "{:<type_width$}  {:<name_width$}  {:<action_width$}\n",
+        "{:type_width$}  {:name_width$}  {:action_width$}\n",
         "Resource Type", "Resource Name", "Action"
     ));
     output.push_str(&format!(
         "{:-<type_width$}  {:-<name_width$}  {:-<action_width$}\n",
         "", "", ""
     ));
-
     for change in resource_changes {
         output.push_str(&format!(
-            "{:<type_width$}  {:<name_width$}  {:<action_width$}\n",
+            "{:type_width$}  {:name_width$}  {:action_width$}\n",
             change.resource_type, change.resource_name, change.action
         ));
     }
-
+    if !quiet {
+        output.push_str(&render_summary_line(counts, no_emoji));
+    }
     output
 }
 
@@ -486,7 +759,24 @@ fn dedup_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     unique
 }
 
+fn resolve_include_action(cli: &Cli, config: &ConfigFile) -> Vec<String> {
+    if cli.only_delete || config.only_delete.unwrap_or(false) {
+        return vec!["delete".to_string()];
+    }
+    if cli.only_create || config.only_create.unwrap_or(false) {
+        return vec!["create".to_string()];
+    }
+    if cli.only_update || config.only_update.unwrap_or(false) {
+        return vec!["update".to_string()];
+    }
+    if cli.only_replace || config.only_replace.unwrap_or(false) {
+        return vec!["replace".to_string()];
+    }
+    cli_or_config_values(&cli.include_action, config.include_action.clone())
+}
+
 fn app_settings(cli: &Cli, config: ConfigFile, config_path: Option<&Path>) -> AppSettings {
+    let include_action = resolve_include_action(cli, &config);
     let plan_file = cli.plan_file.clone().or_else(|| {
         config
             .plan_file
@@ -499,11 +789,24 @@ fn app_settings(cli: &Cli, config: ConfigFile, config_path: Option<&Path>) -> Ap
         no_emoji: cli.no_emoji || config.no_emoji.unwrap_or(false),
         dry_run: cli.dry_run || config.dry_run.unwrap_or(false),
         verbose: cli.verbose || config.verbose.unwrap_or(false),
+        quiet: cli.quiet || config.quiet.unwrap_or(false),
+        no_header: cli.no_header || config.no_header.unwrap_or(false),
         include_type: cli_or_config_values(&cli.include_type, config.include_type),
         exclude_type: cli_or_config_values(&cli.exclude_type, config.exclude_type),
-        include_action: cli_or_config_values(&cli.include_action, config.include_action),
+        include_action,
         exclude_action: cli_or_config_values(&cli.exclude_action, config.exclude_action),
+        fail_on: cli_or_config_values(&cli.fail_on, config.fail_on),
+        github_summary: cli.github_summary || config.github_summary.unwrap_or(false),
+        sort_by: cli.sort_by.or(config.sort_by),
     }
+}
+
+fn has_fail_on_actions(resource_changes: &[ResourceChange], fail_on: &[String]) -> bool {
+    fail_on.iter().any(|pattern| {
+        resource_changes
+            .iter()
+            .any(|change| matches_pattern(&change.action, pattern))
+    })
 }
 
 fn resolve_config_relative_path(path: PathBuf, config_path: Option<&Path>) -> PathBuf {
@@ -559,13 +862,18 @@ fn read_piped_stdin() -> Result<Option<String>, String> {
 
 fn resolve_plan_file_input(path: &Path) -> Result<TerraformInput, String> {
     if !path.exists() {
-        return Err(format!("Path does not exist: {}", path.display()));
+        return Err(format!(
+            "Error: plan file not found at \"{}\"\n\
+            Hint: check the path and ensure the file exists, or run \n            `terraform plan -json > plan.json` in your project directory.",
+            path.display()
+        ));
     }
 
     let abs_path = absolutize(path);
     if !abs_path.is_file() {
         return Err(format!(
-            "--plan-file path is not a file: {}",
+            "Error: --plan-file path is not a file: \"{}\"\n\
+            Hint: pass a JSON/NDJSON plan file or a saved .tfplan file.",
             path.display()
         ));
     }
@@ -775,6 +1083,12 @@ fn init_tracing(verbose: bool) {
 
 fn main() {
     let cli = Cli::parse();
+    if let Some(shell) = cli.completions {
+        let mut cmd = Cli::command();
+        let bin_name = cmd.get_name().to_string();
+        clap_complete::generate(shell, &mut cmd, bin_name, &mut std::io::stdout());
+        return;
+    }
     let (config, config_path) = load_config(&cli).unwrap_or_else(|error| {
         eprintln!("{error}");
         std::process::exit(1);
@@ -806,8 +1120,9 @@ fn main() {
         tracing::error!("{error}");
         std::process::exit(1);
     });
-    let resource_changes = filter_changes(resource_changes, &settings);
-    let stdin_display_path = Path::new("<stdin>");
+    let mut resource_changes = filter_changes(resource_changes, &settings);
+    sort_resource_changes(&mut resource_changes, settings.sort_by);
+    let stdin_display_path = Path::new("");
     let display_path = match &input {
         TerraformInput::StdinJson(_) => stdin_display_path,
         TerraformInput::Directory(directory) => directory.as_path(),
@@ -822,17 +1137,29 @@ fn main() {
             &resource_changes,
             display_path,
             &settings.format,
-            settings.no_emoji
+            settings.no_emoji,
+            settings.quiet,
+            settings.no_header
         )
         .trim_end()
     );
+
+    write_github_summary_if_enabled(&settings, display_path, &resource_changes);
+
+    if has_fail_on_actions(&resource_changes, &settings.fail_on) {
+        tracing::error!("Plan contains forbidden actions matching --fail-on criteria");
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        app_settings, csv_escape, filter_changes, parse_plan_output, render_csv, render_dry_run,
-        render_table, Cli, ConfigFile, Format, ResourceChange, TerraformInput,
+        app_settings, append_github_step_summary, count_actions, csv_escape, filter_changes,
+        has_fail_on_actions, parse_plan_output, render_csv, render_dry_run,
+        render_github_step_summary, render_json, render_summary_line, render_table, render_text,
+        sort_resource_changes, ChangeCounts, Cli, ConfigFile, Format, ResourceChange, SortBy,
+        TerraformInput,
     };
     use clap::Parser;
     use std::path::Path;
@@ -864,18 +1191,18 @@ not-json
     #[test]
     fn parses_saved_plan_json_output() {
         let stdout = r#"{
-  "resource_changes": [
-    {
-      "type": "aws_instance",
-      "name": "web",
-      "change": { "actions": ["delete", "create"] }
-    },
-    {
-      "type": "aws_s3_bucket",
-      "name": "logs",
-      "change": { "actions": ["no-op"] }
-    }
-  ]
+    "resource_changes": [
+        {
+            "type": "aws_instance",
+            "name": "web",
+            "change": { "actions": ["delete", "create"] }
+        },
+        {
+            "type": "aws_s3_bucket",
+            "name": "logs",
+            "change": { "actions": ["no-op"] }
+        }
+    ]
 }"#;
 
         assert_eq!(
@@ -1083,6 +1410,68 @@ not-json
     }
 
     #[test]
+    fn filters_only_update_actions() {
+        let cli = Cli::parse_from(["terraform_plan_parser", "--include-action", "update"]);
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "update".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_rds_cluster".to_string(),
+                resource_name: "db".to_string(),
+                action: "delete".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            filter_changes(changes, &app_settings(&cli, ConfigFile::default(), None)),
+            vec![ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "update".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn filters_only_delete_actions() {
+        let cli = Cli::parse_from(["terraform_plan_parser", "--include-action", "delete"]);
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "update".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_rds_cluster".to_string(),
+                resource_name: "db".to_string(),
+                action: "delete".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            filter_changes(changes, &app_settings(&cli, ConfigFile::default(), None)),
+            vec![ResourceChange {
+                resource_type: "aws_rds_cluster".to_string(),
+                resource_name: "db".to_string(),
+                action: "delete".to_string(),
+            }]
+        );
+    }
+
+    #[test]
     fn renders_dry_run_for_stdin_without_terraform_command() {
         let output = render_dry_run(&TerraformInput::StdinJson("{}".to_string()));
 
@@ -1098,35 +1487,167 @@ not-json
         assert_eq!(csv_escape("name,with,commas"), "\"name,with,commas\"");
         assert_eq!(csv_escape("name \"quoted\""), "\"name \"\"quoted\"\"\"");
         assert_eq!(
-            render_csv(&[ResourceChange {
-                resource_type: "aws_instance".to_string(),
-                resource_name: "web".to_string(),
-                action: "create".to_string(),
-            }]),
+            render_csv(
+                &[ResourceChange {
+                    resource_type: "aws_instance".to_string(),
+                    resource_name: "web".to_string(),
+                    action: "create".to_string(),
+                }],
+                false,
+            ),
             "resource_type,resource_name,action\naws_instance,web,create\n"
+        );
+        assert_eq!(
+            render_csv(
+                &[ResourceChange {
+                    resource_type: "aws_instance".to_string(),
+                    resource_name: "web".to_string(),
+                    action: "create".to_string(),
+                }],
+                true,
+            ),
+            "aws_instance,web,create\n"
         );
     }
 
     #[test]
-    fn renders_table_output() {
-        let output = render_table(
-            &[ResourceChange {
+    fn counts_actions_from_filtered_changes() {
+        let changes = vec![
+            ResourceChange {
                 resource_type: "aws_instance".to_string(),
                 resource_name: "web".to_string(),
                 action: "create".to_string(),
-            }],
-            Path::new("/tmp/project"),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "update".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_rds_cluster".to_string(),
+                resource_name: "db".to_string(),
+                action: "replace".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            count_actions(&changes),
+            ChangeCounts {
+                create: 2,
+                update: 1,
+                delete: 1,
+            }
         );
+        assert_eq!(
+            render_summary_line(&count_actions(&changes), true),
+            "Summary:\n + 2 to create\n ~ 1 to update\n - 1 to delete\n"
+        );
+    }
+
+    #[test]
+    fn renders_summary_counts_in_text_output() {
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "update".to_string(),
+            },
+        ];
+        let counts = count_actions(&changes);
+        let output = render_text(&changes, Path::new("/tmp/project"), true, false, &counts);
+
+        assert!(output.contains("aws_instance"));
+        assert!(output.contains("Summary:"));
+        assert!(output.contains("+ 1 to create"));
+        assert!(output.contains("~ 1 to update"));
+        assert!(output.contains("- 0 to delete"));
+    }
+
+    #[test]
+    fn hides_summary_counts_when_quiet() {
+        let changes = vec![ResourceChange {
+            resource_type: "aws_instance".to_string(),
+            resource_name: "web".to_string(),
+            action: "create".to_string(),
+        }];
+        let counts = count_actions(&changes);
+        let output = render_text(&changes, Path::new("/tmp/project"), true, true, &counts);
+
+        assert!(!output.contains("Summary:"));
+    }
+
+    #[test]
+    fn renders_table_output() {
+        let changes = [ResourceChange {
+            resource_type: "aws_instance".to_string(),
+            resource_name: "web".to_string(),
+            action: "create".to_string(),
+        }];
+        let counts = count_actions(&changes);
+        let output = render_table(&changes, Path::new("/tmp/project"), true, false, &counts);
 
         assert!(output.contains("Resource Type"));
         assert!(output.contains("aws_instance"));
         assert!(output.contains("create"));
+        assert!(output.contains("Summary:"));
+        assert!(output.contains("+ 1 to create"));
+    }
+
+    #[test]
+    fn render_json_serializes_resource_changes() {
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "delete".to_string(),
+            },
+        ];
+        let output = render_json(&changes);
+        assert!(output.contains(r#""resource_type": "aws_instance""#));
+        assert!(output.contains(r#""action": "create""#));
+        assert!(output.contains(r#""action": "delete""#));
+    }
+
+    #[test]
+    fn sorts_resource_changes_by_type() {
+        let mut changes = vec![
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "update".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+        ];
+        sort_resource_changes(&mut changes, Some(SortBy::Type));
+        assert_eq!(changes[0].resource_type, "aws_instance");
+        assert_eq!(changes[1].resource_type, "aws_s3_bucket");
     }
 
     #[test]
     fn accepts_dry_run_from_cli() {
         let cli = Cli::parse_from(["terraform_plan_parser", "--dry-run"]);
         assert!(cli.dry_run);
+    }
+
+    #[test]
+    fn only_delete_shorthand_sets_include_action() {
+        let cli = Cli::parse_from(["terraform_plan_parser", "-d"]);
+        let settings = app_settings(&cli, ConfigFile::default(), None);
+        assert_eq!(settings.include_action, vec!["delete".to_string()]);
     }
 
     #[test]
@@ -1173,5 +1694,84 @@ not-json
         "table",
 ]);
         assert!(matches!(cli.format, Some(Format::Table)));
+    }
+
+    #[test]
+    fn resolve_plan_file_input_reports_missing_file() {
+        let error = crate::resolve_plan_file_input(Path::new("./missing-plan.json"))
+            .expect_err("missing plan file should fail");
+
+        assert!(error.contains("plan file not found"));
+        assert!(error.contains("./missing-plan.json"));
+    }
+
+    #[test]
+    fn fail_on_matches_delete_actions() {
+        let changes = vec![
+            ResourceChange {
+                resource_type: "aws_s3_bucket".to_string(),
+                resource_name: "logs".to_string(),
+                action: "delete".to_string(),
+            },
+            ResourceChange {
+                resource_type: "aws_instance".to_string(),
+                resource_name: "web".to_string(),
+                action: "create".to_string(),
+            },
+        ];
+        assert!(has_fail_on_actions(&changes, &["delete".to_string()]));
+        assert!(!has_fail_on_actions(&changes, &["update".to_string()]));
+        assert!(has_fail_on_actions(
+            &changes,
+            &["delete".to_string(), "create".to_string()]
+        ));
+    }
+
+    #[test]
+    fn renders_github_step_summary_markdown() {
+        let changes = vec![ResourceChange {
+            resource_type: "aws_instance".to_string(),
+            resource_name: "web".to_string(),
+            action: "create".to_string(),
+        }];
+        let counts = count_actions(&changes);
+        let summary = render_github_step_summary(Path::new("plan.ndjson"), &changes, &counts, true);
+
+        assert!(summary.contains("## Terraform plan summary"));
+        assert!(summary.contains("**Plan:** `plan.ndjson`"));
+        assert!(summary.contains("| + Create | 1 |"));
+        assert!(summary.contains("| create | aws_instance | web |"));
+    }
+
+    #[test]
+    fn append_github_step_summary_writes_to_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "terraform_plan_parser_summary_{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let summary_path = dir.join("summary.md");
+        let summary_path = summary_path.to_string_lossy();
+
+        let changes = vec![ResourceChange {
+            resource_type: "aws_s3_bucket".to_string(),
+            resource_name: "logs".to_string(),
+            action: "delete".to_string(),
+        }];
+        let counts = count_actions(&changes);
+
+        append_github_step_summary(
+            &summary_path,
+            Path::new("plan.ndjson"),
+            &changes,
+            &counts,
+            true,
+        )
+        .expect("append summary");
+
+        let written = std::fs::read_to_string(dir.join("summary.md")).expect("read summary");
+        assert!(written.contains("## Terraform plan summary"));
+        assert!(written.contains("| - Delete | 1 |"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
